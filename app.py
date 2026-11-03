@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -637,6 +639,7 @@ def _cancellable(progress):
 
 def run_pipeline(
     video,
+    video_source,
     language_label,
     subtitle_label,
     target_text,
@@ -645,7 +648,7 @@ def run_pipeline(
 ):
     global _rows_json
     _cancel_flag.clear()
-    path = _video_path(video)
+    path = _video_path(video_source) or _video_path(video)
     if not path:
         return "请先上传一个视频文件。", srt_path_value, gr.update(), gr.update(), ""
     if not target_text:
@@ -688,7 +691,7 @@ def run_pipeline(
         summary,
         str(result.srt_path),
         _rows_json,
-        _video_with_subtitles(path, entries),
+        _video_with_subtitles(_video_path(video) or path, entries),
         path,
     )
 
@@ -708,7 +711,7 @@ def save_subtitles(srt_path_value, video_source, video):
     except Exception as exc:
         return f"保存失败：{exc}", gr.update()
 
-    source = _video_path(video) or _video_path(video_source)
+    source = _video_path(video_source) or _video_path(video)
     return f"已保存到：{path}", _video_with_subtitles(source, entries)
 
 
@@ -750,9 +753,145 @@ def _burn_format_default(video) -> str:
         return "mp4"
 
 
-def _video_defaults(video):
-    """上传视频后：填默认字幕路径 + 切到合适的烧录格式。"""
-    return _default_output_path(video), gr.update(value=_burn_format_default(video))
+# ---------- 上传后的在线预览 ----------
+
+
+def _wait_until_readable(path: str, timeout: float = 45.0) -> bool:
+    """刚上传的大文件常被系统扫描临时占用，等能正常读取再交给浏览器。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with open(path, "rb"):
+                return True
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.3)
+        except OSError:
+            return False
+
+
+def _fresh_preview_link(source: str) -> str | None:
+    """给上传文件换一个新链接，让播放器在文件可读后重新加载。"""
+    target = Path(get_upload_folder()) / f"preview_{uuid.uuid4().hex}.mp4"
+    try:
+        os.link(source, target)
+        return str(target)
+    except OSError:
+        pass
+    try:
+        shutil.copy2(source, target)
+        return str(target)
+    except OSError:
+        return None
+
+
+def _playable(source: str) -> bool:
+    try:
+        from gradio.processing_utils import video_is_playable
+
+        return video_is_playable(source)
+    except Exception:
+        return True
+
+
+def _patch_file_response_retry() -> None:
+    """Windows 上刚上传的大文件可能被系统扫描短暂占用，读取会得到 PermissionError，
+    导致播放请求返回 500、前端误报“Video not playable”。这里给 Gradio 与 Starlette
+    的文件响应加一小段重试，等占用释放后正常返回。"""
+    targets = []
+    try:
+        from gradio import ranged_response
+
+        targets.append(ranged_response.RangedFileResponse)
+    except Exception:
+        pass
+    try:
+        from starlette.responses import FileResponse
+
+        targets.append(FileResponse)
+    except Exception:
+        pass
+
+    for response_cls in targets:
+        original = response_cls.__call__
+        if getattr(original, "_retrying_permission", False):
+            continue
+
+        async def retrying_call(self, scope, receive, send, _original=original):
+            # Starlette 的 FileResponse 会先发送响应头再打开文件，
+            # 因此需要先等文件可读，避免头部已发出后读取失败。
+            path = getattr(self, "path", None)
+            if path:
+                try:
+                    if os.path.exists(path):
+                        await asyncio.to_thread(_wait_until_readable, path, 45.0)
+                except Exception:
+                    pass
+
+            deadline = time.monotonic() + 45.0
+            while True:
+                started = False
+
+                async def tracking_send(message):
+                    nonlocal started
+                    started = True
+                    await send(message)
+
+                try:
+                    await _original(self, scope, receive, tracking_send)
+                    return
+                except PermissionError:
+                    if started or time.monotonic() >= deadline:
+                        raise
+                    await asyncio.sleep(0.25)
+
+        retrying_call._retrying_permission = True  # type: ignore[attr-defined]
+        response_cls.__call__ = retrying_call  # type: ignore[method-assign]
+
+
+_patch_file_response_retry()
+
+
+def prepare_video(video):
+    """上传视频后：填默认字幕/格式，并保证预览能在浏览器里播放。"""
+    source = _video_path(video)
+    if source and Path(source).name.startswith(("preview_", "subs_")):
+        # 事件把预览链接写回组件时可能再次触发 input，直接跳过，避免反复重建链接
+        return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
+
+    preview = source
+    note = ""
+
+    if source:
+        readable = _wait_until_readable(source)
+        try:
+            if not _playable(source):
+                from gradio.processing_utils import convert_video_to_playable_mp4
+
+                converted = convert_video_to_playable_mp4(source)
+                if converted and str(converted) != source:
+                    preview = str(converted)
+                    note = "原视频编码浏览器无法直接播放，已生成预览副本；生成字幕仍使用原视频。"
+            if preview == source:
+                fresh = _fresh_preview_link(source)
+                if fresh:
+                    preview = fresh
+        except Exception:
+            preview = source
+        if not readable and preview == source:
+            note = "视频文件暂时被其他程序占用，若无法预览请稍后重新上传。"
+
+    video_update = (
+        gr.update(value=preview) if preview and preview != source else gr.update()
+    )
+    return (
+        _default_output_path(video),
+        gr.update(value=_burn_format_default(source or video)),
+        video_update,
+        source or "",
+        note or gr.update(),
+    )
 
 
 # ---------- 本地设置（记住上次选择的导出目录） ----------
@@ -870,7 +1009,7 @@ def load_subtitles(file):
 
 def choose_soft_target(srt_path_value, video_source, video):
     """先弹「另存为」选路径，选好后再由 soft_mount 执行导出。"""
-    source = _video_path(video) or _video_path(video_source)
+    source = _video_path(video_source) or _video_path(video)
     if not source:
         return "", "请先上传视频。"
     try:
@@ -888,7 +1027,7 @@ def choose_soft_target(srt_path_value, video_source, video):
 def soft_mount(srt_path_value, target_text, video_source, video, progress=gr.Progress()):
     """把字幕作为独立字幕轨封装进视频，画面不重新编码。"""
     _cancel_flag.clear()
-    source = _video_path(video) or _video_path(video_source)
+    source = _video_path(video_source) or _video_path(video)
     if not source:
         return "请先上传视频。"
     if not target_text:
@@ -908,7 +1047,7 @@ def soft_mount(srt_path_value, target_text, video_source, video, progress=gr.Pro
 
 def choose_burn_target(out_format, srt_path_value, video_source, video):
     """先弹「另存为」选路径，选好后再由 burn_video 执行烧录。"""
-    source = _video_path(video) or _video_path(video_source)
+    source = _video_path(video_source) or _video_path(video)
     if not source:
         return "", "请先上传视频。"
     try:
@@ -937,7 +1076,7 @@ def burn_video(
 ):
     """把字幕画进画面，输出单一视频文件（重新编码，耗时较长）。"""
     _cancel_flag.clear()
-    source = _video_path(video) or _video_path(video_source)
+    source = _video_path(video_source) or _video_path(video)
     if not source:
         return "请先上传视频。"
     if not target_text:
@@ -1074,10 +1213,9 @@ def build_ui() -> gr.Blocks:
                 poll_timer = gr.Timer(1)
 
         video.input(
-            _video_defaults,
+            prepare_video,
             inputs=[video],
-            outputs=[srt_path_state, burn_format],
-            show_progress="hidden",
+            outputs=[srt_path_state, burn_format, video, video_source, progress_box],
         )
         run_button.click(
             choose_run_target,
@@ -1086,7 +1224,10 @@ def build_ui() -> gr.Blocks:
             show_progress="hidden",
         ).then(
             run_pipeline,
-            inputs=[video, language, subtitle_language, srt_target, srt_path_state],
+            inputs=[
+                video, video_source, language, subtitle_language,
+                srt_target, srt_path_state,
+            ],
             outputs=[progress_box, srt_path_state, table, video, video_source],
             show_progress_on=[progress_box],
         ).then(backend_status, outputs=status_md, show_progress="hidden")
@@ -1140,10 +1281,36 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+# 视频已显示时 Gradio 不再渲染上传区，拖入文件会触发浏览器默认的「打开文件」行为，
+# 这里在 document 上拦截文件拖放，避免意外弹出新窗口。
+DROP_GUARD_HTML = """
+<script>
+(function () {
+  var isFileDrag = function (event) {
+    var data = event.dataTransfer;
+    if (!data) return false;
+    if (data.files && data.files.length) return true;
+    var types = data.types || [];
+    for (var i = 0; i < types.length; i++) {
+      if (types[i] === "Files") return true;
+    }
+    return false;
+  };
+  var guard = function (event) {
+    if (isFileDrag(event)) event.preventDefault();
+  };
+  document.addEventListener("dragover", guard, true);
+  document.addEventListener("drop", guard, true);
+})();
+</script>
+"""
+
+
 if __name__ == "__main__":
     build_ui().launch(
         server_name="127.0.0.1",
         server_port=7860,
         inbrowser=True,
         show_error=True,
+        head=DROP_GUARD_HTML,
     )
